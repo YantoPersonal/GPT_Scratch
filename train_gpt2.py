@@ -8,6 +8,7 @@ Additional Information:
 - **config_args allows for flexible parameter passing when creating GPTConfig instances or initializing models.
 It's particularly useful when you want to allow users or other parts of your code to specify only the parameters
 they want to change, while using default values for the rest.
+- torch.topk, (used for sample generation): https://pytorch.org/docs/stable/generated/torch.topk.html
 """
 
 # Import Statements:
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 
 class CausalSelfAttention(nn.Module):
@@ -75,7 +77,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)  # LayerNorm: Before MLA instead of After unlike attention paper.
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -106,6 +108,25 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    # 31:07 - Implementing the forward pass to get logits
+    def forward(self, idx):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, \
+            f"Cannot forward sequence length of {T}, as context length is {self.config.block_size}"
+        # Forward the token and position embeddings:
+        pos = torch.arange(0 ,T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = tok_emb + pos_emb
+        # Forward the blocks of the transformer:
+        for block in self.transformer.h:
+            x = block(x)
+        # Forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        return logits
 
     # What are class methods? https://claude.ai/chat/3129336f-ee60-4310-80e2-b9efb6bdcf17
     @classmethod
@@ -146,7 +167,7 @@ class GPT(nn.Module):
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
-                # Special treatment for manual fix, where layers are not in PyTorch format
+                # Special treatment for manual fix, where layers are not in PyTorch format (stupid Tensorflow)
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
@@ -157,3 +178,43 @@ class GPT(nn.Module):
 
         return model
 
+
+num_return_sequences = 5
+max_length = 30
+
+model = GPT.from_pretrained('gpt2')
+model.eval()
+model.to('cuda')
+
+# prefix tokens (Starter text as tokens):
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
+x = tokens.to('cuda')
+
+# 37:07 - Generation:
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x)
+        # take the logits of the last position
+        logits = logits[:, -1, :]
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default), avoids sampling rare tokens only top 50 tokens.
+        # topk_probs here becomes (5, 50) hence topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+        # gather corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+        # append to sequence
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
