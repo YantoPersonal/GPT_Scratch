@@ -182,6 +182,35 @@ class GPT(nn.Module):
         return model
 
 
+# 1:02 - Writing a DataLoader:
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open("input.txt", 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        self.current_position += B * T
+        # out-of-bounds issues:
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -189,23 +218,24 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-# 52:00 - Training the Model (Single Batch):
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])  # Grab the correct number of tokens IN A SEQUENCE (straight line)
-x = buf[:-1].view(B,T).to(device)  # Batch of Data size B, with token length of T.
-y = buf[1:].view(B, T).to(device)  # Batch of Labels (shifted by one) of size B, with the next prediction for each token T.
+# Trainloader:
+train_loader = DataLoaderLite(B=4, T=32)
 
+# Creating Blank Model:
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x, y)
 
-print(logits.shape)
-print(loss)
+# Training Loop:
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Step {i}, loss: {loss.item()}")
+
 sys.exit(0)  # Fancy way of breaking out of the program early.
 
 
@@ -253,3 +283,23 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
+
+
+
+"""
+Replaced Code:
+
+# 52:00 - Training the Model (Single Batch):
+# Loading Batch of the Dataset:
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])  # Grab the correct number of tokens IN A SEQUENCE (straight line)
+x = buf[:-1].view(B,T).to(device)  # Batch of Data size B, with token length of T.
+y = buf[1:].view(B, T).to(device)  # Batch of Labels (shifted by one) of size B, with the next prediction for each token T.
+
+# =================================================
+"""
