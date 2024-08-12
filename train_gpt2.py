@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
+import sys
 
 
 class CausalSelfAttention(nn.Module):
@@ -110,13 +111,13 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     # 31:07 - Implementing the forward pass to get logits
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, \
             f"Cannot forward sequence length of {T}, as context length is {self.config.block_size}"
         # Forward the token and position embeddings:
-        pos = torch.arange(0 ,T, dtype=torch.long, device=idx.device)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         pos_emb = self.transformer.wpe(pos)
         tok_emb = self.transformer.wte(idx)
         x = tok_emb + pos_emb
@@ -126,7 +127,9 @@ class GPT(nn.Module):
         # Forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        return logits
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # Flatten for loss calc
+        return logits, loss
 
     # What are class methods? https://claude.ai/chat/3129336f-ee60-4310-80e2-b9efb6bdcf17
     @classmethod
@@ -179,19 +182,51 @@ class GPT(nn.Module):
         return model
 
 
-num_return_sequences = 5
-max_length = 30
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
 
-model = GPT.from_pretrained('gpt2')
+# 52:00 - Training the Model (Single Batch):
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])  # Grab the correct number of tokens IN A SEQUENCE (straight line)
+x = buf[:-1].view(B,T).to(device)  # Batch of Data size B, with token length of T.
+y = buf[1:].view(B, T).to(device)  # Batch of Labels (shifted by one) of size B, with the next prediction for each token T.
+
+model = GPT(GPTConfig())
+model.to(device)
+logits, loss = model(x, y)
+
+print(logits.shape)
+print(loss)
+sys.exit(0)  # Fancy way of breaking out of the program early.
+
+
+"""
+Old Code - Starter Code for Pre-trained Model: (We've now moved to training our own model)
+model = GPT.from_pretrained('gpt2')  # Creating a Model using huggingface weights.
+model = GPT(GPTConfig())
 model.eval()
-model.to('cuda')
+model.to(device)
+
+
+# num_return_sequences = 5
+# max_length = 30
 
 # prefix tokens (Starter text as tokens):
 enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model")
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
-x = tokens.to('cuda')
+x = tokens.to(device)
+"""
 
 # 37:07 - Generation:
 torch.manual_seed(42)
