@@ -9,6 +9,10 @@ Additional Information:
 It's particularly useful when you want to allow users or other parts of your code to specify only the parameters
 they want to change, while using default values for the rest.
 - torch.topk, (used for sample generation): https://pytorch.org/docs/stable/generated/torch.topk.html
+- Weight Sharing Scheme (1:06): In the original paper from attention is all you need, they share the weights from wte
+(from the initial embedding, with the final output layer of the model. This tensor is used in two places basically,
+at the start and at the end. Initially, our code was not doing this and thus not accurately depicting GPT2,
+and so we fixed this.
 """
 
 # Import Statements:
@@ -30,6 +34,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # See 1:20 part of scaling residuals by 1/sqrt(N)
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -109,6 +114,23 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme (1:06): # weight sharing from token embedding, to the final lm head. shares 30% params.
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    # 1:14 - Initialize weights with the correct standard deviation
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, 0, std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, 0, 0.02)
 
     # 31:07 - Implementing the forward pass to get logits
     def forward(self, idx, targets=None):
@@ -217,6 +239,10 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 # Trainloader:
 train_loader = DataLoaderLite(B=4, T=32)
