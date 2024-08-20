@@ -13,6 +13,11 @@ they want to change, while using default values for the rest.
 (from the initial embedding, with the final output layer of the model. This tensor is used in two places basically,
 at the start and at the end. Initially, our code was not doing this and thus not accurately depicting GPT2,
 and so we fixed this.
+- Flash Attention: https://arxiv.org/abs/2205.14135 - Fuses together the 4 operations, matmul, mask softmax matmul.
+using a fused kernal. torch.compile() cannot find this fusion by itself, so we use a special package to avoid using HBM.
+- Nice & Ugly Numbers 2:08:12: The internals of the GPU are designed primarily around powers of two, and there's special case
+handling for ugly numbers. The special case handling can make things slower, so we look for ugly numbers we can fix.
+- Learning Rate Scheduler (2:21:15):
 """
 
 # Import Statements:
@@ -23,6 +28,12 @@ import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 import sys
+import time
+import inspect
+
+# Bug FIX from 1:49:36 (IG, personal fix)
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 
 class CausalSelfAttention(nn.Module):
@@ -53,10 +64,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         # Attention (materializes the (T, T) matrix for all the queries * keys.
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, hs) * (B, T, nh, hs)) * Normalize
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (b, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # Replaces below in one line of fused kernal.
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, hs) * (B, T, nh, hs)) * Norm
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (b, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # Concatenation Operation
         # Output projection
         y = self.c_proj(y)
@@ -96,6 +108,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024  # max sequence length (context window)
+    # Ugly Number (2:08:12) -> Some are easy to fix than others, this is an easy one to fix.
     vocab_size: int = 50257  # number of tokens: 50,000 BPE + 256 utf-8 + 1 <|endoftext|>
     n_layer: int = 12  # number of  layers
     n_head: int = 12  # number of heads
@@ -203,6 +216,28 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all often candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params}")
+        print(f"num nodecay parameter tensors: {len(nodecay_params)}")
+        # Create AdamW optimizer
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 
 # 1:02 - Writing a DataLoader:
 class DataLoaderLite:
@@ -245,22 +280,54 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # Trainloader:
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=2, T=128) # 4, 32
+torch.set_float32_matmul_precision('high')  # Speed Performance! (1:37:11) But memory bound, LOL!
 
 # Creating Blank Model:
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))  # Replace with number better divisible by 2.
 model.to(device)
+model = torch.compile(model)  # 1:48 - another speed up!
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 
 # Training Loop:
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    torch.cuda.synchronize()  # wait for GPU to finish all scheduled work, then we'll take time.
+    t1 = time.time()
+    dt = (t1-t0)*1000
+    #tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):  # Auto Mixed Precision package torch.amp
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 2:17 - Global Norm of 1.0, better consist
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"Step {i}, loss: {loss.item()}")
+    print(f"Step {step}, loss: {loss.item()}, | lr {lr:.4e} |norm: {norm:.4f} | dt:{dt:.2f}ms")
 
 sys.exit(0)  # Fancy way of breaking out of the program early.
 
